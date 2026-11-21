@@ -278,3 +278,59 @@ func TestSessionRun(t *testing.T) {
 		t.Errorf("expected hello u-root, got %q", string(b[:n]))
 	}
 }
+
+// A command that runs and exits non-zero must report its status to the client,
+// as an *ssh.ExitError. It used to arrive as ssh's own 255 -- the code for a
+// broken connection -- for two reasons, both of which this asserts are gone:
+// runCommand returned before sending exit-status when the command exited
+// non-zero, and the session channel was closed before the request that started
+// the command was replied to, so a client that asks for a reply (every x/crypto
+// Session does) saw EOF and never reached the status at all.
+func TestSessionRunExitStatus(t *testing.T) {
+	cmd := command(params{
+		privkey: "./testdata/id_rsa",
+		keys:    "./testdata/id_rsa.pub",
+		ip:      "127.0.0.1",
+		port:    "2024",
+		debug:   true,
+	})
+	go cmd.run()
+
+	pk, err := os.ReadFile("./testdata/id_rsa")
+	if err != nil {
+		t.Fatalf("can't read private key: %v", err)
+	}
+	signer, err := ssh.ParsePrivateKey(pk)
+	if err != nil {
+		t.Fatalf("can't parse private key: %v", err)
+	}
+	cfg := ssh.ClientConfig{
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         time.Second,
+	}
+	clt := connect(t, net.JoinHostPort(cmd.ip, cmd.port), &cfg)
+	session, err := clt.NewSession()
+	if err != nil {
+		t.Fatalf("can't create session: %v", err)
+	}
+	defer session.Close()
+
+	// Close stdin, or this sshd's non-PTY session waits for its EOF and the test
+	// hangs for the package's own timeout instead of failing: a non-PTY session
+	// ends only at client stdin EOF.
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		t.Fatalf("can't pipe stdin: %v", err)
+	}
+	stdin.Close()
+
+	err = session.Run("exit 3")
+	var exitErr *ssh.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("exit 3: got %v, want an *ssh.ExitError carrying the status", err)
+	}
+	if got := exitErr.ExitStatus(); got != 3 {
+		t.Errorf("exit 3: status %d, want 3", got)
+	}
+}

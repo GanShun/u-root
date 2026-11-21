@@ -7,6 +7,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -72,10 +73,20 @@ func runCommand(c ssh.Channel, p *pty.Pty, cmd string, args ...string) error {
 		e := exec.Command(cmd, args...)
 		e.Stdin, e.Stdout, e.Stderr = c, c, c
 		log.Printf("Executing non-PTY command %s %v", cmd, args)
-		// execute command and wait for response
+		// execute command and wait for response.
+		//
+		// A command that runs and exits non-zero is not a failure to execute it:
+		// exec.Cmd.Run returns an *exec.ExitError for exactly that, and returning
+		// here skips the exit-status request below, so the client gets a channel
+		// close with no status and reports 255 -- the same code it uses for a broken
+		// connection. Only a command that could not be started is an error here.
 		if err := e.Run(); err != nil {
-			dprintf("Failed to execute: %v", err)
-			return err
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				dprintf("Failed to execute: %v", err)
+				return err
+			}
+			dprintf("Exited with status %v", exitErr.ExitCode())
 		}
 
 		ps = e.ProcessState
@@ -176,8 +187,15 @@ func session(chans <-chan ssh.NewChannel) {
 				dprintf("Request %v", req.Type)
 				switch req.Type {
 				case "shell":
-					err := runCommand(channel, p, shell)
-					req.Reply(true, fmt.Appendf(nil, "%v", err))
+					// Reply before running, not after. runCommand closes the
+					// channel when the command is done, so a reply sent afterwards
+					// never arrives: a client that sends its request with wantReply
+					// -- every x/crypto Session does -- gets EOF from that request
+					// and returns before it can read the exit-status, which is how a
+					// non-zero exit came back as 255. OpenSSH acknowledges the
+					// request and then runs it, which is also what a client expects.
+					req.Reply(true, nil)
+					runCommand(channel, p, shell)
 				case "exec":
 					e := &execReq{}
 					if err := ssh.Unmarshal(req.Payload, e); err != nil {
@@ -185,9 +203,10 @@ func session(chans <-chan ssh.NewChannel) {
 						break
 					}
 					// Execute command using user's shell. This is what OpenSSH does
-					// so it's the least surprising to the user.
-					err := runCommand(channel, p, shell, "-c", e.Command)
-					req.Reply(true, fmt.Appendf(nil, "%v", err))
+					// so it's the least surprising to the user. The reply comes
+					// first, for the reason given for "shell" above.
+					req.Reply(true, nil)
+					runCommand(channel, p, shell, "-c", e.Command)
 				case "pty-req":
 					p, err = newPTY(req.Payload)
 					req.Reply(err == nil, nil)
